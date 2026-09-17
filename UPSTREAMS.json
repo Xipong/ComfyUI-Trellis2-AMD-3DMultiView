@@ -1,0 +1,27 @@
+{
+  "wrapper": {
+    "repository": "visualbruno/ComfyUI-Trellis2",
+    "commit": "14597418bbe33a440ead4667e2966408f0524a21",
+    "imported_via": "Xipong/ComfyUI-Trellis2-AMD-3DMultiView"
+  },
+  "amd": {
+    "repository": "dmonkman/ComfyUI-Trellis2-AMD",
+    "commit": "3aa728ad71b6f892a4c3074e5a38c17dd9f0eec5"
+  },
+  "common_base": "98da6e7da2325549ff4e7adbf822098d566a571f",
+  "preserved_wrapper_blobs": {
+    "nodes.py": "a0c9e65453509cc31712a05d344f3c3efbc37156",
+    "trellis2/modules/sparse/basic.py": "c7dadb1a3e052de38ea2e22b5cc0cbcb0c4209c5",
+    "trellis2/pipelines/trellis2_image_to_3d.py": "5d21f99152bf39414df8ccdf2b5b640144b7ea99"
+  },
+  "imported_amd_blobs": {
+    "trellis2/modules/attention/full_attn.py": "0be37a9b4a041842f8ff9d36139ea8a049e61a79",
+    "trellis2/modules/sparse/attention/full_attn.py": "05bfc7cdff9015f2851719656111a31cbe819106"
+  },
+  "amd_wheels_tree": "e39174170f699d0ff4a8ed63b35c71bb8db4589c",
+  "validation": {
+    "donor_reported_hardware": "RX 6800 XT / gfx1030; Windows 11 and Ubuntu 24.04",
+    "merged_fork_gpu_end_to_end": "NOT RUN: requires an AMD GPU and model weights",
+    "cpu_tests": "unittest; mocked Aule tests validate dispatch, not native GPU kernels"
+  }
+}

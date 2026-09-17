@@ -1,43 +1,31 @@
-from typing import *
+"""Sparse convolution and attention settings for AMD and upstream backends."""
+import os
 
-CONV = 'flex_gemm' 
-DEBUG = False
-ATTN = 'flash_attn'
+CONV_BACKENDS = ("none", "spconv", "torchsparse", "flex_gemm")
+ATTN_BACKENDS = ("xformers", "flash_attn", "flash_attn_3", "sdpa", "aule")
+CONV = os.environ.get("SPARSE_CONV_BACKEND", "flex_gemm")
+if CONV not in CONV_BACKENDS:
+    CONV = "flex_gemm"
+ATTN = os.environ.get("SPARSE_ATTN_BACKEND", os.environ.get("ATTN_BACKEND", "sdpa"))
+if ATTN not in ATTN_BACKENDS:
+    ATTN = "sdpa"
+DEBUG = os.environ.get("SPARSE_DEBUG") == "1"
 
-def __from_env():
-    import os
-    
-    global CONV
-    global DEBUG
-    global ATTN
-    
-    env_sparse_conv_backend = os.environ.get('SPARSE_CONV_BACKEND')
-    env_sparse_debug = os.environ.get('SPARSE_DEBUG')
-    env_sparse_attn_backend = os.environ.get('SPARSE_ATTN_BACKEND')
-    if env_sparse_attn_backend is None:
-        env_sparse_attn_backend = os.environ.get('ATTN_BACKEND')
 
-    if env_sparse_conv_backend is not None and env_sparse_conv_backend in ['none', 'spconv', 'torchsparse', 'flex_gemm']:
-        CONV = env_sparse_conv_backend
-    if env_sparse_debug is not None:
-        DEBUG = env_sparse_debug == '1'
-    if env_sparse_attn_backend is not None and env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3']:
-        ATTN = env_sparse_attn_backend
-        
-    print(f"[SPARSE] Conv backend: {CONV}; Attention backend: {ATTN}")
-        
-
-__from_env()
-    
-
-def set_conv_backend(backend: Literal['none', 'spconv', 'torchsparse', 'flex_gemm']):
+def set_conv_backend(backend):
+    if backend not in CONV_BACKENDS:
+        raise ValueError(f"Unknown sparse convolution backend: {backend!r}")
     global CONV
     CONV = backend
 
-def set_debug(debug: bool):
-    global DEBUG
-    DEBUG = debug
 
-def set_attn_backend(backend: Literal['xformers', 'flash_attn']):
+def set_attn_backend(backend):
+    if backend not in ATTN_BACKENDS:
+        raise ValueError(f"Unknown sparse attention backend: {backend!r}")
     global ATTN
     ATTN = backend
+
+
+def set_debug(debug):
+    global DEBUG
+    DEBUG = bool(debug)
