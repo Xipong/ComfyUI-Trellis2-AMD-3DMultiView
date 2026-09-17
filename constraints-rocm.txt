@@ -1,0 +1,6 @@
+# Stack against which the donor's native wheels were built. Install device extras
+# using README.md first; constraints alone do not install the gfx-specific runtime.
+torch==2.13.0+rocm10.0.0
+torchvision==0.28.0+rocm10.0.0
+torchaudio==2.11.0.2+rocm10.0.0
+rocm==10.0.0

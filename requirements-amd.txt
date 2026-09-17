@@ -1,0 +1,4 @@
+-r requirements.txt
+aule_attention
+# Matches the AMD donor's runtime setup. Linux gets Triton from ROCm PyTorch.
+triton-windows; platform_system == 'Windows'

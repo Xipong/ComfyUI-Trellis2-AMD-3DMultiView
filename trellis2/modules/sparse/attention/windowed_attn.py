@@ -1,190 +1,120 @@
-from typing import *
+"""Window attention with explicit Aule/SDPA support and coordinate-safe pairing.
+
+The AMD upstream added Aule to the selector but left both window dispatchers
+without an Aule branch. Partitions here are backend-independent, so switching
+attention backends cannot reuse a cached xformers-only attention mask.
+"""
+import logging
 import torch
-import math
-from .. import SparseTensor
-from .. import config
+from .. import SparseTensor, config
+
+__all__ = ["sparse_windowed_scaled_dot_product_self_attention",
+           "sparse_windowed_scaled_dot_product_cross_attention"]
+log = logging.getLogger(__name__)
 
 
-__all__ = [
-    'sparse_windowed_scaled_dot_product_self_attention',
-    'sparse_windowed_scaled_dot_product_cross_attention',
-]
+def _window_coords(tensor, window_size, shift_window):
+    dims = tensor.coords.shape[1] - 1
+    size = (window_size,) * dims if isinstance(window_size, int) else tuple(window_size)
+    shift = (shift_window,) * dims if isinstance(shift_window, int) else tuple(shift_window)
+    if len(size) != dims or len(shift) != dims or any(s <= 0 for s in size):
+        raise ValueError("Window sizes must be positive and match the coordinate dimensions")
+    coords = tensor.coords.to(torch.int64).clone()
+    coords[:, 1:] = torch.div(
+        coords[:, 1:] + coords.new_tensor(shift), coords.new_tensor(size),
+        rounding_mode="floor")
+    return coords
 
 
-def calc_window_partition(
-    tensor: SparseTensor,
-    window_size: Union[int, Tuple[int, ...]],
-    shift_window: Union[int, Tuple[int, ...]] = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[int]]:
-    """
-    Calculate serialization and partitioning for a set of coordinates.
+def _partition(inverse, count):
+    fwd = torch.argsort(inverse, stable=True)
+    bwd = torch.empty_like(fwd)
+    bwd[fwd] = torch.arange(len(fwd), device=fwd.device)
+    lengths = torch.bincount(inverse, minlength=count)
+    return fwd, bwd, lengths
 
-    Args:
-        tensor (SparseTensor): The input tensor.
-        window_size (int): The window size to use.
-        shift_window (Tuple[int, ...]): The shift of serialized coordinates.
 
-    Returns:
-        (torch.Tensor): Forwards indices.
-        (torch.Tensor): Backwards indices.
-        (torch.Tensor): Sequence lengths.
-        (dict): Attn func args.
-    """
-    DIM = tensor.coords.shape[1] - 1
-    shift_window = (shift_window,) * DIM if isinstance(shift_window, int) else shift_window
-    window_size = (window_size,) * DIM if isinstance(window_size, int) else window_size
-    shifted_coords = tensor.coords.clone().detach()
-    shifted_coords[:, 1:] += torch.tensor(shift_window, device=tensor.device, dtype=torch.int32).unsqueeze(0)
+def calc_window_partition(tensor: SparseTensor, window_size, shift_window=0):
+    coords = _window_coords(tensor, window_size, shift_window)
+    unique, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+    fwd, bwd, lengths = _partition(inverse, len(unique))
+    cumulative = torch.cat((lengths.new_zeros(1), lengths.cumsum(0))).to(torch.int32)
+    return fwd, bwd, lengths, {
+        "cu_seqlens": cumulative,
+        "max_seqlen": int(lengths.max().item()) if lengths.numel() else 0,
+    }
 
-    MAX_COORDS = [i + j for i, j in zip(tensor.spatial_shape, shift_window)]
-    NUM_WINDOWS = [math.ceil((mc + 1) / ws) for mc, ws in zip(MAX_COORDS, window_size)]
-    OFFSET = torch.cumprod(torch.tensor([1] + NUM_WINDOWS[::-1]), dim=0).tolist()[::-1]
 
-    shifted_coords[:, 1:] //= torch.tensor(window_size, device=tensor.device, dtype=torch.int32).unsqueeze(0)
-    shifted_indices = (shifted_coords * torch.tensor(OFFSET, device=tensor.device, dtype=torch.int32).unsqueeze(0)).sum(dim=1)
-    fwd_indices = torch.argsort(shifted_indices)
-    bwd_indices = torch.empty_like(fwd_indices)
-    bwd_indices[fwd_indices] = torch.arange(fwd_indices.shape[0], device=tensor.device)
-    seq_lens = torch.bincount(shifted_indices)
-    mask = seq_lens != 0
-    seq_lens = seq_lens[mask]
-    
-    if config.ATTN == 'xformers':
-        if 'xops' not in globals():
-            import xformers.ops as xops
-        attn_func_args = {
-            'attn_bias': xops.fmha.BlockDiagonalMask.from_seqlens(seq_lens)
-        }
-    elif config.ATTN == 'flash_attn':
-        attn_func_args = {
-            'cu_seqlens': torch.cat([torch.tensor([0], device=tensor.device), torch.cumsum(seq_lens, dim=0)], dim=0).int(),
-            'max_seqlen': torch.max(seq_lens)
-        }
+def _attend(q, k, v):
+    """[L,H,C] in and out. Never mix tokens from unrelated sparse windows."""
+    if q.shape[0] == 0 or k.shape[0] == 0:
+        return q.new_zeros((q.shape[0], q.shape[1], v.shape[-1]))
+    backend = config.ATTN
+    if backend == "aule":
+        from aule import flash_attention_triton
+        args = [x.transpose(0, 1).unsqueeze(0) for x in (q, k, v)]
+        return flash_attention_triton(*args, causal=False)[0].transpose(0, 1)
+    if backend in ("flash_attn", "flash_attn_3", "xformers"):
+        try:
+            if backend == "xformers":
+                from xformers.ops import memory_efficient_attention
+                result = memory_efficient_attention(q[None], k[None], v[None])
+            elif backend == "flash_attn":
+                from flash_attn import flash_attn_func
+                result = flash_attn_func(q[None], k[None], v[None])
+            else:
+                from flash_attn_interface import flash_attn_func
+                result = flash_attn_func(q[None], k[None], v[None])
+                if isinstance(result, tuple):
+                    result = result[0]
+            return result[0]
+        except (ImportError, NotImplementedError) as exc:
+            # Do not swallow OOM, invalid inputs, or native kernel faults.
+            log.warning("TRELLIS.2 window attention: %s unavailable (%s); using SDPA", backend, exc)
+    elif backend != "sdpa":
+        raise ValueError(f"Unknown sparse window attention backend: {backend!r}")
+    args = [x.transpose(0, 1).unsqueeze(0) for x in (q, k, v)]
+    return torch.nn.functional.scaled_dot_product_attention(
+        *args, dropout_p=0.0, is_causal=False)[0].transpose(0, 1)
 
-    return fwd_indices, bwd_indices, seq_lens, attn_func_args
-    
 
 def sparse_windowed_scaled_dot_product_self_attention(
-    qkv: SparseTensor,
-    window_size: int,
-    shift_window: Tuple[int, int, int] = (0, 0, 0)
-) -> SparseTensor:
-    """
-    Apply windowed scaled dot product self attention to a sparse tensor.
-
-    Args:
-        qkv (SparseTensor): [N, *, 3, H, C] sparse tensor containing Qs, Ks, and Vs.
-        window_size (int): The window size to use.
-        shift_window (Tuple[int, int, int]): The shift of serialized coordinates.
-        
-    Returns:
-        (SparseTensor): [N, *, H, C] sparse tensor containing the output features.
-    """
-    assert len(qkv.shape) == 4 and qkv.shape[1] == 3, f"Invalid shape for qkv, got {qkv.shape}, expected [N, *, 3, H, C]"
-
-    serialization_spatial_cache_name = f'windowed_attention_{window_size}_{shift_window}'
-    serialization_spatial_cache = qkv.get_spatial_cache(serialization_spatial_cache_name)
-    if serialization_spatial_cache is None:
-        fwd_indices, bwd_indices, seq_lens, attn_func_args = calc_window_partition(qkv, window_size, shift_window)
-        qkv.register_spatial_cache(serialization_spatial_cache_name, (fwd_indices, bwd_indices, seq_lens, attn_func_args))
-    else:
-        fwd_indices, bwd_indices, seq_lens, attn_func_args = serialization_spatial_cache
-    
-    qkv_feats = qkv.feats[fwd_indices]      # [M, 3, H, C]
-
-    if config.DEBUG:
-        start = 0
-        qkv_coords = qkv.coords[fwd_indices]
-        for i in range(len(seq_lens)):
-            seq_coords = qkv_coords[start:start+seq_lens[i]]
-            assert (seq_coords[:, 1:].max(dim=0).values - seq_coords[:, 1:].min(dim=0).values < window_size).all(), \
-                    f"SparseWindowedScaledDotProductSelfAttention: window size exceeded"
-            start += seq_lens[i]
-
-    if config.ATTN == 'xformers':
-        if 'xops' not in globals():
-            import xformers.ops as xops
-        q, k, v = qkv_feats.unbind(dim=1)                                               # [M, H, C]
-        q = q.unsqueeze(0)                                                              # [1, M, H, C]
-        k = k.unsqueeze(0)                                                              # [1, M, H, C]
-        v = v.unsqueeze(0)                                                              # [1, M, H, C]
-        out = xops.memory_efficient_attention(q, k, v, **attn_func_args)[0]             # [M, H, C]
-    elif config.ATTN == 'flash_attn':
-        if 'flash_attn' not in globals():
-            import flash_attn
-        out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv_feats, **attn_func_args)  # [M, H, C]
-
-    out = out[bwd_indices]      # [T, H, C]
-
-    if config.DEBUG:
-        qkv_coords = qkv_coords[bwd_indices]
-        assert torch.equal(qkv_coords, qkv.coords), "SparseWindowedScaledDotProductSelfAttention: coordinate mismatch"
-
-    return qkv.replace(out)
+        qkv: SparseTensor, window_size: int, shift_window=(0, 0, 0)):
+    if qkv.feats.ndim != 4 or qkv.feats.shape[1] != 3:
+        raise ValueError("qkv features must have shape [T,3,H,C]")
+    if qkv.feats.shape[0] == 0:
+        return qkv.replace(qkv.feats.new_empty((0, *qkv.feats.shape[2:])))
+    name = f"amd_window_v1_{window_size}_{shift_window}"
+    partition = qkv.get_spatial_cache(name)
+    if partition is None:
+        partition = calc_window_partition(qkv, window_size, shift_window)
+        qkv.register_spatial_cache(name, partition)
+    fwd, bwd, lengths, _ = partition
+    outputs = [_attend(*chunk.unbind(1))
+               for chunk in qkv.feats[fwd].split(lengths.tolist())]
+    return qkv.replace(torch.cat(outputs, dim=0)[bwd])
 
 
 def sparse_windowed_scaled_dot_product_cross_attention(
-    q: SparseTensor,
-    kv: SparseTensor,
-    q_window_size: int,
-    kv_window_size: int,
-    q_shift_window: Tuple[int, int, int] = (0, 0, 0),
-    kv_shift_window: Tuple[int, int, int] = (0, 0, 0),
-) -> SparseTensor:
-    """
-    Apply windowed scaled dot product cross attention to two sparse tensors.
-
-    Args:
-        q (SparseTensor): [N, *, H, C] sparse tensor containing Qs.
-        kv (SparseTensor): [N, *, 2, H, C] sparse tensor containing Ks and Vs.
-        q_window_size (int): The window size to use for Qs.
-        kv_window_size (int): The window size to use for Ks and Vs.
-        q_shift_window (Tuple[int, int, int]): The shift of serialized coordinates for Qs.
-        kv_shift_window (Tuple[int, int, int]): The shift of serialized coordinates for Ks and Vs.
-        
-    Returns:
-        (SparseTensor): [N, *, H, C] sparse tensor containing the output features.
-    """
-    assert len(q.shape) == 3, f"Invalid shape for q, got {q.shape}, expected [N, *, H, C]"
-    assert len(kv.shape) == 4 and kv.shape[1] == 2, f"Invalid shape for kv, got {kv.shape}, expected [N, *, 2, H, C]"
-
-    q_serialization_spatial_cache_name = f'windowed_attention_{q_window_size}_{q_shift_window}'
-    q_serialization_spatial_cache = q.get_spatial_cache(q_serialization_spatial_cache_name)
-    if q_serialization_spatial_cache is None:
-        q_fwd_indices, q_bwd_indices, q_seq_lens, q_attn_func_args = calc_window_partition(q, q_window_size, q_shift_window)
-        q.register_spatial_cache(q_serialization_spatial_cache_name, (q_fwd_indices, q_bwd_indices, q_seq_lens, q_attn_func_args))
-    else:
-        q_fwd_indices, q_bwd_indices, q_seq_lens, q_attn_func_args = q_serialization_spatial_cache
-    kv_serialization_spatial_cache_name = f'windowed_attention_{kv_window_size}_{kv_shift_window}'
-    kv_serialization_spatial_cache = kv.get_spatial_cache(kv_serialization_spatial_cache_name)
-    if kv_serialization_spatial_cache is None:
-        kv_fwd_indices, kv_bwd_indices, kv_seq_lens, kv_attn_func_args = calc_window_partition(kv, kv_window_size, kv_shift_window)
-        kv.register_spatial_cache(kv_serialization_spatial_cache_name, (kv_fwd_indices, kv_bwd_indices, kv_seq_lens, kv_attn_func_args))
-    else:
-        kv_fwd_indices, kv_bwd_indices, kv_seq_lens, kv_attn_func_args = kv_serialization_spatial_cache
-
-    assert len(q_seq_lens) == len(kv_seq_lens), "Number of sequences in q and kv must match"
-
-    q_feats = q.feats[q_fwd_indices]      # [M, H, C]
-    kv_feats = kv.feats[kv_fwd_indices]    # [M, 2, H, C]
-
-    if config.ATTN == 'xformers':
-        if 'xops' not in globals():
-            import xformers.ops as xops
-        k, v = kv_feats.unbind(dim=1)                                                   # [M, H, C]
-        q = q.unsqueeze(0)                                                              # [1, M, H, C]
-        k = k.unsqueeze(0)                                                              # [1, M, H, C]
-        v = v.unsqueeze(0)                                                              # [1, M, H, C]
-        mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seq_lens, kv_seq_lens)
-        out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)[0]               # [M, H, C]
-    elif config.ATTN == 'flash_attn':
-        if 'flash_attn' not in globals():
-            import flash_attn
-        out = flash_attn.flash_attn_varlen_kvpacked_func(q_feats, kv_feats,
-            cu_seqlens_q=q_attn_func_args['cu_seqlens'], cu_seqlens_k=kv_attn_func_args['cu_seqlens'],
-            max_seqlen_q=q_attn_func_args['max_seqlen'], max_seqlen_k=kv_attn_func_args['max_seqlen'],
-        )  # [M, H, C]
-
-    out = out[q_bwd_indices]      # [T, H, C]
-
-    return q.replace(out)
+        q: SparseTensor, kv: SparseTensor, q_window_size: int, kv_window_size: int,
+        q_shift_window=(0, 0, 0), kv_shift_window=(0, 0, 0)):
+    if q.feats.ndim != 3 or kv.feats.ndim != 4 or kv.feats.shape[1] != 2:
+        raise ValueError("Expected q features [T,H,C] and kv features [T,2,H,C]")
+    if q.shape[0] != kv.shape[0] or q.device != kv.device:
+        raise ValueError("q and kv must share batch size and device")
+    if q.feats.shape[0] == 0:
+        return q.replace(q.feats.new_empty((0, q.feats.shape[1], kv.feats.shape[-1])))
+    # Pair by (batch, x-window, y-window, z-window), NOT by the ordinal
+    # positions of nonempty windows. Q and KV may have different occupancy.
+    qc = _window_coords(q, q_window_size, q_shift_window)
+    kc = _window_coords(kv, kv_window_size, kv_shift_window)
+    unique, inverse = torch.unique(torch.cat((qc, kc)), dim=0, sorted=True,
+                                   return_inverse=True)
+    qf, qb, qlengths = _partition(inverse[:len(qc)], len(unique))
+    kf, _, klengths = _partition(inverse[len(qc):], len(unique))
+    outputs = []
+    for qs, ks in zip(q.feats[qf].split(qlengths.tolist()),
+                      kv.feats[kf].split(klengths.tolist())):
+        if qs.shape[0]:
+            outputs.append(_attend(qs, *ks.unbind(1)))
+    return q.replace(torch.cat(outputs, dim=0)[qb])

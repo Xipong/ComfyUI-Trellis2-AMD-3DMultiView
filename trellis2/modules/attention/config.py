@@ -1,32 +1,22 @@
-from typing import *
+"""Dense attention configuration, including the ROCm/Aule backend."""
+import os
 
-BACKEND = 'flash_attn' 
-DEBUG = False
+SUPPORTED_BACKENDS = ("xformers", "flash_attn", "flash_attn_3", "sdpa", "naive", "aule")
+# Importing the extension must not require an NVIDIA attention package. The
+# ComfyUI loader resolves auto to the appropriate backend before inference.
+BACKEND = os.environ.get("ATTN_BACKEND", "sdpa")
+if BACKEND not in SUPPORTED_BACKENDS:
+    BACKEND = "sdpa"
+DEBUG = os.environ.get("ATTN_DEBUG") == "1"
 
-def __from_env():
-    import os
-    
-    global BACKEND
-    global DEBUG
-    
-    env_attn_backend = os.environ.get('ATTN_BACKEND')
-    env_attn_debug = os.environ.get('ATTN_DEBUG')
-    
-    if env_attn_backend is not None and env_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3', 'sdpa', 'naive']:
-        BACKEND = env_attn_backend
-    if env_attn_debug is not None:
-        DEBUG = env_attn_debug == '1'
 
-    print(f"[ATTENTION] Using backend: {BACKEND}")
-        
-
-__from_env()
-    
-
-def set_backend(backend: Literal['xformers', 'flash_attn']):
+def set_backend(backend):
+    if backend not in SUPPORTED_BACKENDS:
+        raise ValueError(f"Unknown dense attention backend: {backend!r}")
     global BACKEND
     BACKEND = backend
 
-def set_debug(debug: bool):
+
+def set_debug(debug):
     global DEBUG
-    DEBUG = debug
+    DEBUG = bool(debug)

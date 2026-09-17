@@ -1,3 +1,5 @@
+# Node/model dependencies only: do not pin or replace ComfyUI's own frontend.
+# Install ROCm torch separately; never add generic torch/torchvision here.
 meshlib
 requests
 pymeshlab
@@ -6,3 +8,24 @@ scipy
 open3d
 plotly
 rembg
+onnxruntime
+pyfqmr
+numpy>=1.25
+pillow
+einops
+easydict
+huggingface-hub
+safetensors
+transformers==4.56.0
+timm
+imageio
+imageio-ffmpeg
+trimesh
+plyfile
+kornia
+pandas
+lpips
+zstandard
+ninja
+tensorboard
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
